@@ -153,13 +153,31 @@ impl FlatVector<'_> {
 }
 
 /// A trait for inserting variable-length data into a flat vector.
+///
+/// Insertions require exclusive access, so an initialized slice cannot remain
+/// live across a write:
+///
+/// ```compile_fail
+/// use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeId};
+///
+/// let chunk = DataChunkHandle::new(&[LogicalTypeId::Varchar.into()]);
+/// let mut vector = chunk.flat_vector(0);
+/// let values = unsafe { vector.as_slice_with_len::<u8>(0) };
+/// vector.insert(0, "value");
+/// dbg!(values);
+/// ```
 pub trait Inserter<T> {
     /// Inserts `value` at `index`.
-    fn insert(&self, index: usize, value: T);
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` exceeds the vector capacity or the vector belongs to
+    /// a read-only DuckDB callback input.
+    fn insert(&mut self, index: usize, value: T);
 }
 
 impl Inserter<CString> for FlatVector<'_> {
-    fn insert(&self, index: usize, value: CString) {
+    fn insert(&mut self, index: usize, value: CString) {
         self.vector.ensure_writable().or_panic();
         self.vector.check_index(index, "row index").or_panic();
         unsafe { crate::ffi::duckdb_vector_assign_string_element(self.ptr(), index as u64, value.as_ptr()) };
@@ -167,19 +185,19 @@ impl Inserter<CString> for FlatVector<'_> {
 }
 
 impl Inserter<&str> for FlatVector<'_> {
-    fn insert(&self, index: usize, value: &str) {
+    fn insert(&mut self, index: usize, value: &str) {
         self.insert(index, value.as_bytes());
     }
 }
 
 impl Inserter<&String> for FlatVector<'_> {
-    fn insert(&self, index: usize, value: &String) {
+    fn insert(&mut self, index: usize, value: &String) {
         self.insert(index, value.as_str());
     }
 }
 
 impl Inserter<&[u8]> for FlatVector<'_> {
-    fn insert(&self, index: usize, value: &[u8]) {
+    fn insert(&mut self, index: usize, value: &[u8]) {
         self.vector.ensure_writable().or_panic();
         self.vector.check_index(index, "row index").or_panic();
         unsafe {
@@ -194,7 +212,7 @@ impl Inserter<&[u8]> for FlatVector<'_> {
 }
 
 impl Inserter<&Vec<u8>> for FlatVector<'_> {
-    fn insert(&self, index: usize, value: &Vec<u8>) {
+    fn insert(&mut self, index: usize, value: &Vec<u8>) {
         self.insert(index, value.as_slice());
     }
 }

@@ -155,7 +155,7 @@ impl VTab for Numbers {
                 }
             }
             {
-                let name = parity.child(1, rows);
+                let mut name = parity.child(1, rows);
                 for i in 0..rows {
                     name.insert(i, if (start + i) % 2 == 0 { "even" } else { "odd" });
                 }

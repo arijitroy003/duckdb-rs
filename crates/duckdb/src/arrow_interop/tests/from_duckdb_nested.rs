@@ -341,7 +341,7 @@ fn test_data_chunk_to_arrow_masks_array_children_under_null_parents() -> Result<
     chunk.set_len(2);
 
     let mut array = chunk.array_vector(0);
-    let child = array.child(4);
+    let mut child = array.child(4);
     child.insert(0, "one");
     child.insert(1, "two");
     drop(child);

@@ -40,13 +40,13 @@ fn inserts_string_and_binary_values() {
     chunk.set_len(3);
 
     {
-        let vector = chunk.flat_vector(0);
+        let mut vector = chunk.flat_vector(0);
         vector.insert(0, "first");
         vector.insert(1, &String::from("second"));
         vector.insert(2, CString::new("third").unwrap());
     }
     {
-        let vector = chunk.flat_vector(1);
+        let mut vector = chunk.flat_vector(1);
         vector.insert(0, b"hello".as_slice());
         vector.insert(1, &b"world".to_vec());
         vector.insert(2, b"!".as_slice());
