@@ -118,12 +118,7 @@ impl<'a> FlatVector<'a> {
     /// # Panics
     /// Panics if `data` exceeds the effective capacity.
     pub unsafe fn copy<T: Copy>(&mut self, data: &[T]) {
-        assert!(
-            data.len() <= self.capacity(),
-            "copy length {} exceeds vector capacity {}",
-            data.len(),
-            self.capacity()
-        );
+        self.vector.check_slice_len(data.len()).or_panic();
         if data.is_empty() {
             return;
         }
@@ -166,11 +161,7 @@ pub trait Inserter<T> {
 impl Inserter<CString> for FlatVector<'_> {
     fn insert(&self, index: usize, value: CString) {
         self.vector.ensure_writable().or_panic();
-        assert!(
-            index < self.capacity(),
-            "row index {index} exceeds vector capacity {}",
-            self.capacity()
-        );
+        self.vector.check_index(index, "row index").or_panic();
         unsafe { crate::ffi::duckdb_vector_assign_string_element(self.ptr(), index as u64, value.as_ptr()) };
     }
 }
@@ -190,11 +181,7 @@ impl Inserter<&String> for FlatVector<'_> {
 impl Inserter<&[u8]> for FlatVector<'_> {
     fn insert(&self, index: usize, value: &[u8]) {
         self.vector.ensure_writable().or_panic();
-        assert!(
-            index < self.capacity(),
-            "row index {index} exceeds vector capacity {}",
-            self.capacity()
-        );
+        self.vector.check_index(index, "row index").or_panic();
         unsafe {
             crate::ffi::duckdb_vector_assign_string_element_len(
                 self.ptr(),
