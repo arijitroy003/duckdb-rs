@@ -411,6 +411,38 @@ mod test {
         }
     }
 
+    struct NulErrorVTab<const STAGE: u8>;
+
+    impl<const STAGE: u8> VTab for NulErrorVTab<STAGE> {
+        type InitData = ();
+        type BindData = ();
+
+        fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
+            if STAGE == 0 {
+                return Err("table bind before\0after".into());
+            }
+            bind.add_result_column("value", LogicalTypeId::Bigint.into());
+            Ok(())
+        }
+
+        fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
+            if STAGE == 1 {
+                Err("table init before\0after".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn func(_: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
+            if STAGE == 2 {
+                Err("table execution before\0after".into())
+            } else {
+                output.set_len(0);
+                Ok(())
+            }
+        }
+    }
+
     static TABLE_BIND_DATA_DROPS: AtomicU64 = AtomicU64::new(0);
     static TABLE_INIT_DATA_DROPS: AtomicU64 = AtomicU64::new(0);
 
@@ -520,6 +552,29 @@ mod test {
 
         let func_error = conn.prepare("SELECT * FROM error_func()")?.query([]).err().unwrap();
         assert!(func_error.to_string().contains("table execution callback error"));
+        Ok(())
+    }
+
+    #[test]
+    fn table_errors_escape_interior_nuls_at_every_callback_stage() -> Result<(), Box<dyn Error>> {
+        let conn = Connection::open_in_memory()?;
+        conn.register_table_function::<NulErrorVTab<0>>("nul_error_bind")?;
+        conn.register_table_function::<NulErrorVTab<1>>("nul_error_init")?;
+        conn.register_table_function::<NulErrorVTab<2>>("nul_error_func")?;
+
+        let bind_error = conn.prepare("SELECT * FROM nul_error_bind()").err().unwrap();
+        let init_error = conn.prepare("SELECT * FROM nul_error_init()")?.query([]).err().unwrap();
+        let func_error = conn.prepare("SELECT * FROM nul_error_func()")?.query([]).err().unwrap();
+
+        for (error, expected) in [
+            (bind_error, "table bind before\\0after"),
+            (init_error, "table init before\\0after"),
+            (func_error, "table execution before\\0after"),
+        ] {
+            let message = error.to_string();
+            assert!(message.contains(expected), "unexpected callback error: {message}");
+            assert!(!message.contains('\0'));
+        }
         Ok(())
     }
 

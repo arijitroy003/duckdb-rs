@@ -370,6 +370,27 @@ mod test {
         }
     }
 
+    struct ErrorWithPanickingDropStateScalar;
+
+    impl VScalar for ErrorWithPanickingDropStateScalar {
+        type State = PanickingDropState;
+
+        fn invoke(
+            _: &Self::State,
+            _: &mut DataChunkHandle,
+            _: &mut dyn WritableVector,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            Err("scalar error before state drop".into())
+        }
+
+        fn signatures() -> Vec<ScalarFunctionSignature> {
+            vec![ScalarFunctionSignature::exact(
+                vec![LogicalTypeId::Bigint.into()],
+                LogicalTypeId::Bigint.into(),
+            )]
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct TestState {
         multiplier: usize,
@@ -504,6 +525,59 @@ mod test {
         }
     }
 
+    struct NestedListRoundTripScalar;
+
+    impl VScalar for NestedListRoundTripScalar {
+        type State = ();
+
+        fn invoke(
+            _: &Self::State,
+            input: &mut DataChunkHandle,
+            output: &mut dyn WritableVector,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let input_list = input.list_vector(0);
+            let input_child = input_list.read_child()?;
+            let mut values = Vec::new();
+            let mut entries = Vec::with_capacity(input.len());
+
+            for row in 0..input.len() {
+                let Some(range) = input_list.try_get_range(row)? else {
+                    entries.push(None);
+                    continue;
+                };
+                let len = range.len();
+                let output_offset = values.len();
+                for child_row in range {
+                    values.push(unsafe { input_child.read::<i32>(child_row)? });
+                }
+                entries.push(Some((output_offset, len)));
+            }
+            drop(input_child);
+            drop(input_list);
+
+            let mut output_list = output.list_vector();
+            output_list.try_reserve(values.len())?;
+            unsafe { output_list.child(values.len()).copy(&values) };
+            for (row, entry) in entries.into_iter().enumerate() {
+                if let Some((offset, len)) = entry {
+                    output_list.set_entry(row, offset, len);
+                } else {
+                    output_list.set_null(row);
+                }
+            }
+            output_list.try_set_len(values.len())?;
+            Ok(())
+        }
+
+        fn signatures() -> Vec<ScalarFunctionSignature> {
+            let child_type = LogicalTypeHandle::from(LogicalTypeId::Integer);
+            vec![ScalarFunctionSignature::exact(
+                vec![LogicalTypeHandle::list(&child_type)],
+                LogicalTypeHandle::list(&child_type),
+            )]
+        }
+    }
+
     #[test]
     fn test_scalar() -> Result<(), Box<dyn Error>> {
         let conn = Connection::open_in_memory()?;
@@ -610,6 +684,24 @@ mod test {
     }
 
     #[test]
+    fn scalar_errors_survive_panicking_state_destructors() -> Result<(), Box<dyn Error>> {
+        SCALAR_STATE_DROPS.store(0, Ordering::SeqCst);
+        {
+            let conn = Connection::open_in_memory()?;
+            conn.register_scalar_function::<ErrorWithPanickingDropStateScalar>("error_with_panicking_drop")?;
+            let error = conn
+                .prepare("SELECT error_with_panicking_drop(1)")?
+                .query([])
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("scalar error before state drop"));
+        }
+
+        assert!(SCALAR_STATE_DROPS.load(Ordering::SeqCst) > 0);
+        Ok(())
+    }
+
+    #[test]
     fn test_repeat_scalar() -> Result<(), Box<dyn Error>> {
         let conn = Connection::open_in_memory()?;
         conn.register_scalar_function::<Repeat>("nobie_repeat")?;
@@ -641,6 +733,23 @@ mod test {
             .collect::<Result<Vec<_>, _>>()?;
 
         assert_eq!(values, [0, 1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn registered_scalar_round_trips_nested_vectors_through_native_seam() -> Result<(), Box<dyn Error>> {
+        let conn = Connection::open_in_memory()?;
+        conn.register_scalar_function::<NestedListRoundTripScalar>("native_list_round_trip")?;
+
+        let values = conn
+            .prepare(
+                "SELECT native_list_round_trip(value) = value \
+                 FROM (VALUES ([1, 2]::INTEGER[]), ([]::INTEGER[]), ([3]::INTEGER[])) input(value)",
+            )?
+            .query_map([], |row| row.get::<_, bool>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(values, [true, true, true]);
         Ok(())
     }
 
