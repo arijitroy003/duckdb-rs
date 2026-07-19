@@ -77,6 +77,11 @@ impl DataChunkHandle {
     /// Its payload starts under construction. Native Arrow writers finalize it
     /// automatically; manual writers must use [`Self::assume_initialized`]
     /// before safe reads or Arrow conversion.
+    ///
+    /// # Panics
+    ///
+    /// Panics if DuckDB rejects one of the logical types or cannot initialize
+    /// the data chunk.
     pub fn new(logical_types: &[LogicalTypeHandle]) -> Self {
         let num_columns = logical_types.len();
         let mut c_types = Vec::with_capacity(num_columns);
@@ -101,8 +106,9 @@ impl DataChunkHandle {
     ///
     /// # Panics
     ///
-    /// Panics if `idx` is out of range, the column is a nested type, or the
-    /// column already has an active compatibility view.
+    /// Panics if `idx` is out of range, the column is not represented by flat
+    /// storage (`LIST`, `MAP`, `ARRAY`, `STRUCT`, or `UNION`), or the column
+    /// already has an active compatibility view.
     pub fn flat_vector(&self, idx: usize) -> FlatVector<'_> {
         FlatVector::from_vector(self.compatibility_vector(idx)).or_panic()
     }
@@ -153,6 +159,7 @@ impl DataChunkHandle {
         // mutable-aliasing hole.
         unsafe { VectorRef::compatibility(ptr, capacity, &self.state) }
             .and_then(|vector| BorrowGuard::acquire(ptr).map(|guard| vector.with_borrow_guard(guard)))
+            .map_err(|error| duckdb_failure_from_message(format!("column {idx}: {error}")))
             .or_panic()
     }
 
@@ -198,7 +205,16 @@ impl DataChunkHandle {
         }
     }
 
-    /// Set the size of the data chunk
+    /// Set the size of the data chunk.
+    ///
+    /// This remains a shared-reference operation so changing cardinality can
+    /// revoke reads through already-live compatibility views. The shared state
+    /// coordinates that revocation and rejects callback input at runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `new_len` exceeds the backing capacity or this is a read-only
+    /// DuckDB callback input chunk.
     pub fn set_len(&self, new_len: usize) {
         self.try_set_len(new_len).or_panic();
     }
@@ -281,7 +297,7 @@ impl DataChunkHandle {
         self.check_vector_capacity(len)?;
         self.check_readable_len(len)?;
         let ptr = unsafe { duckdb_data_chunk_get_vector(self.ptr, idx as u64) };
-        // SAFETY: chunk initialization now gates this construction, and the
+        // SAFETY: chunk initialization gates this construction, and the
         // requested span was checked against committed initialized rows.
         let vector = unsafe { VectorRef::initialized_from_chunk(ptr, len, &self.state) }?;
         BorrowGuard::acquire(ptr).map(|guard| vector.with_borrow_guard(guard))
@@ -415,6 +431,26 @@ mod test {
             let mut raw = unsafe { crate::core::WritableVectorRef::from_raw(&mut ptr, 1) }.unwrap();
             let vector = crate::core::WritableVector::flat_vector(&mut raw);
             assert_eq!(vector.capacity(), 1);
+        }
+
+        unsafe { crate::ffi::duckdb_destroy_vector(&mut ptr) };
+    }
+
+    #[test]
+    fn raw_writable_vectors_report_an_actionable_read_error() {
+        let logical_type = LogicalTypeHandle::from(LogicalTypeId::Bigint);
+        let mut ptr = unsafe { crate::ffi::duckdb_create_vector(logical_type.ptr, 1) };
+
+        {
+            let mut raw = unsafe { crate::core::WritableVectorRef::from_raw(&mut ptr, 1) }.unwrap();
+            let vector = crate::core::WritableVector::flat_vector(&mut raw);
+            let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                unsafe { vector.as_slice_with_len::<i64>(1) };
+            }))
+            .unwrap_err();
+            assert!(panic_payload(error.as_ref()).contains(
+                "raw writable vector payload is under construction; finish the writable adapter and read through its initialized owner"
+            ));
         }
 
         unsafe { crate::ffi::duckdb_destroy_vector(&mut ptr) };

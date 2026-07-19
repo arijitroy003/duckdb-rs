@@ -48,6 +48,11 @@ pub trait VScalar: Sized {
     /// Native output and child accessors borrow their owner mutably. Legacy
     /// top-level chunk accessors also lease at most one active view per column,
     /// so safe implementations cannot create aliased writable views.
+    ///
+    /// Panics are converted to DuckDB query errors. If `State` uses interior
+    /// mutability, implementations must still preserve or restore its
+    /// invariants during unwinding because the same state may serve later
+    /// invocations.
     fn invoke(
         state: &Self::State,
         input: &mut DataChunkHandle,

@@ -11,6 +11,10 @@ fn active_vector_views() -> MutexGuard<'static, HashSet<usize>> {
     ACTIVE_VECTOR_VIEWS
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
+        // The registry only inserts and removes `usize` keys; neither
+        // operation invokes user code. A panic can conservatively leave an
+        // active key behind, but cannot invalidate the HashSet's structure, so
+        // continuing with the poisoned guard preserves alias rejection.
         .unwrap_or_else(PoisonError::into_inner)
 }
 

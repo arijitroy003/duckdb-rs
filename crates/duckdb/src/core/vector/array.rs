@@ -1,4 +1,4 @@
-use super::{FlatVector, ResultExt, VectorAccess, VectorRef, WritableVectorRef, state::StateRef};
+use super::{FlatVector, ResultExt, VectorAccess, VectorRef, WritableVectorRef};
 use crate::{
     Result,
     core::LogicalTypeHandle,
@@ -38,8 +38,13 @@ impl VectorRef<'_> {
         }
         let backing_capacity = self.array_child_capacity()?;
         if capacity > backing_capacity {
+            let remedy = if backing_capacity == 0 {
+                "; reserve or commit the containing list child before writing nested values"
+            } else {
+                ""
+            };
             return Err(duckdb_failure_from_message(format!(
-                "array child capacity {capacity} exceeds backing capacity {backing_capacity}"
+                "array child capacity {capacity} exceeds backing capacity {backing_capacity}{remedy}"
             )));
         }
         let ptr = unsafe { duckdb_array_vector_get_child(self.ptr) };
@@ -48,7 +53,7 @@ impl VectorRef<'_> {
             Self::new(
                 ptr,
                 capacity,
-                StateRef::Borrowed(self.state.shared()),
+                self.state.reborrow(),
                 self.readable_span.scaled(array_size)?,
                 self.access,
             )
@@ -68,7 +73,7 @@ impl VectorRef<'_> {
             Self::new(
                 ptr,
                 capacity,
-                StateRef::Borrowed(self.state.shared()),
+                self.state.reborrow(),
                 readable_span,
                 VectorAccess::ReadOnly,
             )
@@ -115,6 +120,11 @@ impl<'a> ArrayVector<'a> {
     }
 
     /// Returns a flat child view with an explicit element capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is not a multiple of the fixed array width or
+    /// exceeds the array child's backing capacity.
     pub fn child(&mut self, capacity: usize) -> FlatVector<'_> {
         FlatVector::from_vector(self.vector.array_child_mut(capacity).or_panic()).or_panic()
     }
@@ -123,11 +133,22 @@ impl<'a> ArrayVector<'a> {
     ///
     /// # Safety
     /// `T` must match the child vector's physical storage.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data.len()` is not a multiple of the fixed array width,
+    /// exceeds the child backing capacity, or this vector belongs to a
+    /// read-only DuckDB callback input.
     pub unsafe fn set_child<T: Copy>(&mut self, data: &[T]) {
         unsafe { self.child(data.len()).copy(data) };
     }
 
     /// Marks one parent row null.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `row` exceeds the parent capacity or this vector belongs to a
+    /// read-only DuckDB callback input.
     pub fn set_null(&mut self, row: usize) {
         self.vector.set_null(row);
     }

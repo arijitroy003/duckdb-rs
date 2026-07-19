@@ -206,7 +206,7 @@ impl<'a> VectorRef<'a> {
             Self::new(
                 self.ptr,
                 self.capacity,
-                StateRef::Borrowed(self.state.shared()),
+                self.state.reborrow(),
                 self.readable_span,
                 self.access,
             )
@@ -216,11 +216,11 @@ impl<'a> VectorRef<'a> {
     }
 
     fn ensure_initialized(&self) -> Result<()> {
-        self.state.shared().readable_len_or_err().map(|_| ())
+        self.state.readable_len_or_err().map(|_| ())
     }
 
     pub(crate) fn readable_len(&self) -> Result<usize> {
-        let chunk_len = self.state.shared().readable_len_or_err()?;
+        let chunk_len = self.state.readable_len_or_err()?;
         let len = match self.readable_span {
             ReadableSpan::Chunk { multiplier } => chunk_len
                 .checked_mul(multiplier)
@@ -298,6 +298,10 @@ impl<'a> VectorRef<'a> {
     pub(super) fn try_set_null(&mut self, row: usize) -> Result<()> {
         self.ensure_writable()?;
         self.check_index(row, "row index")?;
+        // This is the only safe validity mutation and it only transitions a
+        // row from valid to invalid. In particular, a list entry whose child
+        // bounds were skipped because its parent is null cannot later become
+        // readable through safe code without rewriting the entry.
         // SAFETY: the row is bounded above and the mutable view is unique.
         unsafe {
             duckdb_vector_ensure_validity_writable(self.ptr);
@@ -417,7 +421,7 @@ impl VectorRef<'_> {
             Self::new(
                 self.ptr,
                 self.capacity,
-                StateRef::Borrowed(self.state.shared()),
+                self.state.reborrow(),
                 self.readable_span,
                 VectorAccess::ReadOnly,
             )

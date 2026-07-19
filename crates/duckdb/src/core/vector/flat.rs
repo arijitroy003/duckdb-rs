@@ -41,6 +41,10 @@ impl<'a> FlatVector<'a> {
     /// # Safety
     /// `T` must match DuckDB's physical storage and the caller must initialize
     /// every slot before it is read.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this vector belongs to a read-only DuckDB callback input.
     pub unsafe fn as_mut_ptr<T>(&mut self) -> *mut T {
         self.vector.data_mut_ptr().or_panic()
     }
@@ -54,8 +58,11 @@ impl<'a> FlatVector<'a> {
     ///
     /// # Panics
     ///
-    /// Panics while the owning data chunk is still under construction. Finish
-    /// the writable view and call `DataChunkHandle::assume_initialized` first.
+    /// Panics while the payload remains under construction. Chunk-backed
+    /// writers can finish their views and call
+    /// [`DataChunkHandle::assume_initialized`](crate::core::DataChunkHandle::assume_initialized);
+    /// raw writable adapters must be dropped and read through an initialized
+    /// owner instead.
     pub unsafe fn as_slice<T>(&self) -> &[T] {
         unsafe { self.vector.as_slice(self.capacity()) }.or_panic()
     }
@@ -69,9 +76,11 @@ impl<'a> FlatVector<'a> {
     ///
     /// # Panics
     ///
-    /// Panics if `len` exceeds the vector capacity or while the owning data
-    /// chunk is still under construction. Finish the writable view and call
-    /// `DataChunkHandle::assume_initialized` first.
+    /// Panics if `len` exceeds the vector capacity or while the payload remains
+    /// under construction. Chunk-backed writers can finish their views and
+    /// call [`DataChunkHandle::assume_initialized`](crate::core::DataChunkHandle::assume_initialized);
+    /// raw writable adapters must be dropped and read through an initialized
+    /// owner instead.
     pub unsafe fn as_slice_with_len<T>(&self, len: usize) -> &[T] {
         unsafe { self.vector.as_slice(len) }.or_panic()
     }
@@ -82,6 +91,10 @@ impl<'a> FlatVector<'a> {
     /// `T` must match DuckDB's physical storage, the returned span must already
     /// contain valid `T` values, and no other references to that storage may
     /// exist. Use a typed copy/write interface to initialize new storage.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this vector belongs to a read-only DuckDB callback input.
     pub unsafe fn as_mut_slice<T>(&mut self) -> &mut [T] {
         let capacity = self.capacity();
         unsafe { self.vector.as_mut_slice(capacity) }.or_panic()
@@ -93,6 +106,11 @@ impl<'a> FlatVector<'a> {
     /// `T` must match DuckDB's physical storage, the returned span must already
     /// contain valid `T` values, and no other references to that storage may
     /// exist. Use a typed copy/write interface to initialize new storage.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` exceeds the vector capacity or this vector belongs to a
+    /// read-only DuckDB callback input.
     pub unsafe fn as_mut_slice_with_len<T>(&mut self, len: usize) -> &mut [T] {
         unsafe { self.vector.as_mut_slice(len) }.or_panic()
     }
@@ -105,7 +123,8 @@ impl<'a> FlatVector<'a> {
     /// Marks one row null.
     ///
     /// # Panics
-    /// Panics if `row` is outside the vector capacity.
+    /// Panics if `row` is outside the vector capacity or this vector belongs to
+    /// a read-only DuckDB callback input.
     pub fn set_null(&mut self, row: usize) {
         self.vector.set_null(row);
     }
@@ -116,7 +135,8 @@ impl<'a> FlatVector<'a> {
     /// `T` must match DuckDB's physical storage.
     ///
     /// # Panics
-    /// Panics if `data` exceeds the effective capacity.
+    /// Panics if `data` exceeds the effective capacity or this vector belongs
+    /// to a read-only DuckDB callback input.
     pub unsafe fn copy<T: Copy>(&mut self, data: &[T]) {
         self.vector.check_slice_len(data.len()).or_panic();
         if data.is_empty() {
@@ -135,7 +155,8 @@ impl<'a> FlatVector<'a> {
     /// `T` must match DuckDB's physical storage for this vector.
     ///
     /// # Panics
-    /// Panics if `row` is outside the vector capacity.
+    /// Panics if `row` is outside the vector capacity or this vector belongs to
+    /// a read-only DuckDB callback input.
     pub unsafe fn write<T>(&mut self, row: usize, value: T) {
         unsafe { self.vector.write(row, value) }.or_panic();
     }

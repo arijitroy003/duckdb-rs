@@ -9,9 +9,6 @@ pub(crate) fn panic_payload(payload: &(dyn Any + Send)) -> String {
     {
         message.to_owned()
     } else {
-        format!(
-            "non-string panic payload ({:?}); use a string panic message for details",
-            payload.type_id()
-        )
+        "non-string panic payload; use a string panic message for details".to_owned()
     }
 }

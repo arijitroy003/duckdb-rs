@@ -350,6 +350,25 @@ fn array_and_struct_child_capacity_reject_overreach() {
 }
 
 #[test]
+fn fresh_nested_array_capacity_error_explains_the_reservation_order() {
+    let array_type = LogicalTypeHandle::array(&LogicalTypeId::Integer.into(), 2);
+    let list_type = LogicalTypeHandle::list(&array_type);
+    let chunk = DataChunkHandle::new(&[list_type]);
+    let mut list = chunk.list_vector(0);
+    let mut array = list.array_child();
+
+    let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        array.child(2);
+    }))
+    .unwrap_err();
+
+    assert_eq!(
+        panic_payload(error.as_ref()),
+        "array child capacity 2 exceeds backing capacity 0; reserve or commit the containing list child before writing nested values"
+    );
+}
+
+#[test]
 #[cfg(target_pointer_width = "64")]
 fn oversized_list_reservation_is_rejected_before_ffi() {
     let list_type = LogicalTypeHandle::list(&LogicalTypeId::Integer.into());

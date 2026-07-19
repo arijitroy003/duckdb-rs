@@ -2,7 +2,7 @@ use super::{
     FlatVector, ResultExt, VectorAccess, VectorRef, WritableVectorRef,
     array::ArrayVector,
     resize::{MAX_VECTOR_SIZE, max_resize_data_width},
-    state::{ReadableSpan, StateRef},
+    state::ReadableSpan,
     r#struct::StructVector,
 };
 use std::ops::Range;
@@ -172,7 +172,7 @@ impl VectorRef<'_> {
             Self::new(
                 ptr,
                 capacity,
-                StateRef::Borrowed(self.state.shared()),
+                self.state.reborrow(),
                 ReadableSpan::Fixed(readable_len),
                 self.access,
             )
@@ -189,7 +189,7 @@ impl VectorRef<'_> {
             Self::new(
                 ptr,
                 capacity,
-                StateRef::Borrowed(self.state.shared()),
+                self.state.reborrow(),
                 ReadableSpan::Fixed(readable_len),
                 self.access,
             )
@@ -229,7 +229,7 @@ impl VectorRef<'_> {
             Self::new(
                 ptr,
                 capacity,
-                StateRef::Borrowed(self.state.shared()),
+                self.state.reborrow(),
                 ReadableSpan::Fixed(capacity),
                 VectorAccess::ReadOnly,
             )
@@ -245,7 +245,7 @@ impl VectorRef<'_> {
             Self::new(
                 ptr,
                 capacity,
-                StateRef::Borrowed(self.state.shared()),
+                self.state.reborrow(),
                 ReadableSpan::Fixed(capacity),
                 self.access,
             )
@@ -296,12 +296,18 @@ impl<'a> ListVector<'a> {
     }
 
     /// Returns the current fixed-size-array child span.
+    ///
+    /// A fresh list has a zero-length child span. Reserve or commit the list
+    /// child before using a non-empty nested array child.
     pub fn array_child(&mut self) -> ArrayVector<'_> {
         let vector = self.vector.current_list_child_mut().or_panic();
         ArrayVector::from_vector(vector).or_panic()
     }
 
     /// Returns the current nested-list child span.
+    ///
+    /// A fresh list has a zero-length child span. Reserve or commit the parent
+    /// list child before using a non-empty nested list child.
     pub fn list_child(&mut self) -> ListVector<'_> {
         let vector = self.vector.current_list_child_mut().or_panic();
         ListVector::from_vector(vector).or_panic()
@@ -321,6 +327,11 @@ impl<'a> ListVector<'a> {
     ///
     /// # Safety
     /// `T` must match the child vector's physical storage.
+    ///
+    /// # Panics
+    ///
+    /// Panics if reservation or commit fails, or if this vector belongs to a
+    /// read-only DuckDB callback input.
     pub unsafe fn set_child<T: Copy>(&mut self, data: &[T]) {
         {
             let mut child = self.child(data.len());
@@ -334,7 +345,8 @@ impl<'a> ListVector<'a> {
     /// # Panics
     ///
     /// Panics if the row is outside the parent capacity, the range overflows,
-    /// or a non-null entry exceeds reserved or committed child storage.
+    /// a non-null entry exceeds reserved or committed child storage, or this
+    /// vector belongs to a read-only DuckDB callback input.
     pub fn set_entry(&mut self, row: usize, offset: usize, length: usize) {
         self.try_set_entry(row, offset, length).or_panic();
     }
@@ -348,9 +360,9 @@ impl<'a> ListVector<'a> {
     ///
     /// # Panics
     ///
-    /// Panics if `row` is out of range or null, or while the owning data chunk
-    /// is still under construction. Finish the writable view and call
-    /// `DataChunkHandle::assume_initialized` before reading.
+    /// Panics if `row` is out of range or null, or while the payload remains
+    /// under construction. Raw writable adapters do not become readable in
+    /// place; finish them and read through an initialized owner.
     pub fn get_entry(&self, row: usize) -> (usize, usize) {
         self.try_get_entry(row).or_panic()
     }
@@ -361,6 +373,11 @@ impl<'a> ListVector<'a> {
     }
 
     /// Marks one parent row null.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `row` exceeds the parent capacity or this vector belongs to a
+    /// read-only DuckDB callback input.
     pub fn set_null(&mut self, row: usize) {
         self.vector.set_null(row);
     }
@@ -375,6 +392,11 @@ impl<'a> ListVector<'a> {
     }
 
     /// Reserves and commits the list-child size.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the size cannot be reserved or this vector belongs to a
+    /// read-only DuckDB callback input.
     pub fn set_len(&mut self, len: usize) {
         self.try_set_len(len).or_panic();
     }

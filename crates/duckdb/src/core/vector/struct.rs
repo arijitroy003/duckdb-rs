@@ -1,9 +1,6 @@
 use libduckdb_sys::DuckDbString;
 
-use super::{
-    FlatVector, ResultExt, VectorAccess, VectorRef, WritableVectorRef, array::ArrayVector, list::ListVector,
-    state::StateRef,
-};
+use super::{FlatVector, ResultExt, VectorAccess, VectorRef, WritableVectorRef, array::ArrayVector, list::ListVector};
 use crate::{Result, core::LogicalTypeHandle, error::duckdb_failure_from_message, ffi::duckdb_struct_vector_get_child};
 
 impl VectorRef<'_> {
@@ -28,17 +25,10 @@ impl VectorRef<'_> {
             )));
         }
         let ptr = unsafe { duckdb_struct_vector_get_child(self.ptr, index as u64) };
-        // SAFETY: struct children share the parent's allocation and the
-        // mutable parent borrow uniquely reaches this child.
-        unsafe {
-            Self::new(
-                ptr,
-                capacity,
-                StateRef::Borrowed(self.state.shared()),
-                self.readable_span,
-                self.access,
-            )
-        }
+        // SAFETY: DuckDB keeps each child vector live with its parent, the
+        // explicit capacity is bounded by the parent, and the mutable parent
+        // borrow uniquely reaches this child.
+        unsafe { Self::new(ptr, capacity, self.state.reborrow(), self.readable_span, self.access) }
     }
 }
 
@@ -53,7 +43,7 @@ impl VectorRef<'_> {
             Self::new(
                 ptr,
                 self.capacity,
-                StateRef::Borrowed(self.state.shared()),
+                self.state.reborrow(),
                 self.readable_span,
                 VectorAccess::ReadOnly,
             )

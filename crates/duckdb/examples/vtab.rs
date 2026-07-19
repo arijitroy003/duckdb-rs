@@ -94,7 +94,7 @@ impl VTab for Numbers {
         }
         let rows = capacity.min(count - start);
 
-        // BIGINT: copy initialized values into the vector.
+        // BIGINT: write one initialized value per row.
         {
             let mut v = output.flat_vector(0);
             for i in 0..rows {
@@ -124,10 +124,10 @@ impl VTab for Numbers {
             }
         }
 
-        // LIST<BIGINT>: concatenate every row's children into one contiguous
-        // child vector, pointing each row's entry at its slice as we go. Note
-        // that an empty list (e.g. for n = 0) is distinct from a NULL list,
-        // which you'd produce with `list.set_null(i)`.
+        // LIST<BIGINT>: buffer every row's child values and entry range, commit
+        // the contiguous child storage, then point the entries into it. An
+        // empty list (e.g. for n = 0) is distinct from a NULL list, which you'd
+        // produce with `list.set_null(i)`.
         {
             let mut list = output.list_vector(3);
             let mut children: Vec<i64> = Vec::new();
