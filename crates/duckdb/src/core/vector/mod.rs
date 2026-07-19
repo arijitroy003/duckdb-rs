@@ -110,6 +110,11 @@ impl<'a> VectorRef<'a> {
         capacity: usize,
         state: &'a VectorStateCell,
     ) -> Result<Self> {
+        if matches!(state.get(), VectorState::CallbackInput { .. }) {
+            return Err(duckdb_failure_from_message(
+                "DuckDB callback input vectors are read-only",
+            ));
+        }
         unsafe { Self::from_chunk(ptr, capacity, state, VectorAccess::Writable, ReadableSpan::Fixed(0)) }
     }
 

@@ -82,6 +82,10 @@ impl DataChunkHandle {
         let mut c_types = Vec::with_capacity(num_columns);
         c_types.extend(logical_types.iter().map(|t| t.ptr));
         let ptr = unsafe { duckdb_create_data_chunk(c_types.as_mut_ptr(), num_columns as u64) };
+        assert!(
+            !ptr.is_null(),
+            "DuckDB could not create data chunk for the requested logical types"
+        );
         Self {
             ptr,
             owned: true,
@@ -323,6 +327,16 @@ mod test {
     }
 
     #[test]
+    fn data_chunk_creation_rejects_null_ffi_result() {
+        let result = std::panic::catch_unwind(|| {
+            DataChunkHandle::new(&[LogicalTypeHandle::from(LogicalTypeId::Any)]);
+        })
+        .unwrap_err();
+
+        assert!(panic_payload(result.as_ref()).contains("DuckDB could not create data chunk"));
+    }
+
+    #[test]
     fn test_vector() {
         let mut datachunk = DataChunkHandle::new(&[LogicalTypeHandle::from(LogicalTypeId::Bigint)]);
         {
@@ -508,6 +522,23 @@ mod test {
         }))
         .unwrap_err();
         assert!(panic_payload(mutation.as_ref()).contains("callback input vectors are read-only"));
+    }
+
+    #[test]
+    #[cfg(feature = "vtab")]
+    fn callback_input_state_cannot_construct_a_writable_vector() {
+        let mut owner = DataChunkHandle::new(&[LogicalTypeHandle::from(LogicalTypeId::Bigint)]);
+        owner.flat_vector(0).set_null(0);
+        owner.set_len(1);
+        unsafe { owner.assume_initialized() };
+        let input = unsafe { DataChunkHandle::new_unowned_input(owner.ptr) };
+        let ptr = unsafe { duckdb_data_chunk_get_vector(input.ptr, 0) };
+
+        let error = unsafe { VectorRef::writable_from_chunk(ptr, 1, &input.state) }
+            .err()
+            .unwrap();
+
+        assert_eq!(error.to_string(), "DuckDB callback input vectors are read-only");
     }
 
     #[test]
