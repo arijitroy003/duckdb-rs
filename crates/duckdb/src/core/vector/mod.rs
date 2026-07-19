@@ -226,9 +226,11 @@ impl<'a> VectorRef<'a> {
     }
 
     fn mark_under_construction(&self) {
-        if !matches!(self.state.shared().get(), VectorState::CallbackInput { .. }) {
-            self.state.shared().set(VectorState::UnderConstruction);
-        }
+        debug_assert!(
+            !matches!(self.state.shared().get(), VectorState::CallbackInput { .. }),
+            "writable vector cannot share callback input state"
+        );
+        self.state.shared().set(VectorState::UnderConstruction);
     }
 
     pub(super) fn ensure_writable(&self) -> Result<()> {

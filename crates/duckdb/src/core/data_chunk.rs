@@ -272,14 +272,14 @@ impl DataChunkHandle {
 
 #[cfg_attr(not(feature = "vtab-arrow"), allow(dead_code))]
 impl DataChunkHandle {
-    pub(crate) fn initialized_vector(&self, idx: usize, capacity: usize) -> Result<VectorRef<'_>> {
+    pub(crate) fn initialized_vector(&self, idx: usize, len: usize) -> Result<VectorRef<'_>> {
         self.check_column_index(idx)?;
-        self.check_vector_capacity(capacity)?;
-        self.check_readable_len(capacity)?;
+        self.check_vector_capacity(len)?;
+        self.check_readable_len(len)?;
         let ptr = unsafe { duckdb_data_chunk_get_vector(self.ptr, idx as u64) };
         // SAFETY: chunk initialization now gates this construction, and the
         // requested span was checked against committed initialized rows.
-        let vector = unsafe { VectorRef::initialized_from_chunk(ptr, capacity, &self.state) }?;
+        let vector = unsafe { VectorRef::initialized_from_chunk(ptr, len, &self.state) }?;
         BorrowGuard::acquire(ptr).map(|guard| vector.with_borrow_guard(guard))
     }
 
