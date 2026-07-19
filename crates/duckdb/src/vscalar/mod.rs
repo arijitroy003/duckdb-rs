@@ -218,10 +218,17 @@ impl InnerConnection {
 mod test {
     use std::{
         error::Error,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
-    use arrow::array::Array;
+    use arrow::{
+        array::{Array, Int64Array},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
     use libduckdb_sys::duckdb_string_t;
 
     use crate::{
@@ -289,6 +296,33 @@ mod test {
             _: &mut dyn WritableVector,
         ) -> Result<(), Box<dyn std::error::Error>> {
             Err("before\0after".into())
+        }
+
+        fn signatures() -> Vec<ScalarFunctionSignature> {
+            vec![ScalarFunctionSignature::exact(
+                vec![LogicalTypeId::Bigint.into()],
+                LogicalTypeId::Bigint.into(),
+            )]
+        }
+    }
+
+    struct InputRewriteScalar;
+
+    impl VScalar for InputRewriteScalar {
+        type State = ();
+
+        fn invoke(
+            _: &Self::State,
+            input: &mut DataChunkHandle,
+            output: &mut dyn WritableVector,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![99_i64]))])?;
+            crate::arrow_interop::record_batch_to_duckdb_data_chunk(&batch, input)?;
+
+            let mut output = output.flat_vector();
+            unsafe { output.write(0, 42_i64) };
+            Ok(())
         }
 
         fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -545,6 +579,19 @@ mod test {
 
         assert!(message.contains("before\\0after"));
         assert!(!message.contains('\0'));
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_callback_input_cannot_be_rewritten_by_arrow_conversion() -> Result<(), Box<dyn Error>> {
+        let conn = Connection::open_in_memory()?;
+        conn.register_scalar_function::<InputRewriteScalar>("rewrite_input")?;
+
+        let error = conn
+            .query_row("SELECT rewrite_input(1)", [], |row| row.get::<_, i64>(0))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("callback input data chunks are read-only"));
         Ok(())
     }
 

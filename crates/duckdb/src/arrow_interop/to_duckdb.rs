@@ -129,7 +129,7 @@ pub fn record_batch_to_duckdb_data_chunk(
     batch: &RecordBatch,
     chunk: &mut DataChunkHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    chunk.begin_write();
+    chunk.begin_write()?;
     // Fill the row
     assert_eq!(batch.num_columns(), chunk.num_columns());
     for i in 0..batch.num_columns() {

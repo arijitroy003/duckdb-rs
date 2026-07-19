@@ -284,10 +284,9 @@ impl DataChunkHandle {
     }
 
     pub(crate) fn writable_vector(&mut self, idx: usize, capacity: usize) -> Result<WritableVectorRef<'_>> {
-        self.ensure_writable()?;
         self.check_column_index(idx)?;
         self.check_vector_capacity(capacity)?;
-        self.begin_write();
+        self.begin_write()?;
         let ptr = unsafe { duckdb_data_chunk_get_vector(self.ptr, idx as u64) };
         // SAFETY: the mutable chunk borrow uniquely owns the column for the
         // returned view's lifetime and DuckDB allocated the requested span.
@@ -296,8 +295,10 @@ impl DataChunkHandle {
         }))
     }
 
-    pub(crate) fn begin_write(&mut self) {
+    pub(crate) fn begin_write(&mut self) -> Result<()> {
+        self.ensure_writable()?;
         self.state.set(VectorState::UnderConstruction);
+        Ok(())
     }
 }
 
