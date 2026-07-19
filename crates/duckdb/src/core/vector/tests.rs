@@ -118,6 +118,25 @@ fn list_entries_cannot_exceed_reserved_child_storage() {
         list.try_set_entry(0, 1, 2).unwrap_err().to_string(),
         "list entry at row 0 ends at 3, beyond reserved or committed child capacity 2"
     );
+
+    assert_eq!(
+        list.try_set_entry(0, usize::MAX, 1).unwrap_err().to_string(),
+        "DuckDB list entry at row 0 overflows usize"
+    );
+}
+
+#[test]
+fn dropped_list_reservations_are_not_reused_by_a_new_view() {
+    let list_type = LogicalTypeHandle::list(&LogicalTypeId::Integer.into());
+    let chunk = DataChunkHandle::new(&[list_type]);
+
+    chunk.list_vector(0).try_reserve(2).unwrap();
+
+    let mut list = chunk.list_vector(0);
+    assert_eq!(
+        list.try_set_entry(0, 0, 1).unwrap_err().to_string(),
+        "list entry at row 0 ends at 1, beyond reserved or committed child capacity 0"
+    );
 }
 
 #[test]
@@ -184,10 +203,23 @@ fn validity_bounds_are_shared_by_all_family_adapters() {
         LogicalTypeHandle::struct_type(&[("value", LogicalTypeId::Integer.into())]),
     ]);
 
-    assert!(chunk.flat_vector(0).try_row_is_null(row).is_err());
-    assert!(chunk.list_vector(1).try_row_is_null(row).is_err());
-    assert!(chunk.array_vector(2).try_row_is_null(row).is_err());
-    assert!(chunk.struct_vector(3).try_row_is_null(row).is_err());
+    let expected = format!("row index {row} exceeds vector capacity {}", chunk.capacity());
+    assert_eq!(
+        chunk.flat_vector(0).try_row_is_null(row).unwrap_err().to_string(),
+        expected
+    );
+    assert_eq!(
+        chunk.list_vector(1).try_row_is_null(row).unwrap_err().to_string(),
+        expected
+    );
+    assert_eq!(
+        chunk.array_vector(2).try_row_is_null(row).unwrap_err().to_string(),
+        expected
+    );
+    assert_eq!(
+        chunk.struct_vector(3).try_row_is_null(row).unwrap_err().to_string(),
+        expected
+    );
 }
 
 #[test]
@@ -244,7 +276,10 @@ fn list_children_use_reserved_capacity_without_standard_floor() -> Result<()> {
     let chunk = DataChunkHandle::new(&[list_type]);
     let mut list = chunk.list_vector(0);
 
-    assert!(list.list_child().try_row_is_null(0).is_err());
+    assert_eq!(
+        list.list_child().try_row_is_null(0).unwrap_err().to_string(),
+        "row index 0 exceeds vector capacity 0"
+    );
 
     let child_count = unsafe { crate::ffi::duckdb_vector_size() as usize } + 1;
     list.try_set_len(child_count)?;
@@ -277,7 +312,7 @@ fn nested_array_capacity_is_checked_and_can_exceed_standard_vector_size() -> Res
     let array = ArrayVector::from_vector(list.read_child()?)?;
     let child = array.read_child()?;
     let output = unsafe { child.as_slice::<i32>(data.len())? };
-    assert_eq!(output.last(), data.last());
+    assert_eq!(output, data);
     Ok(())
 }
 
@@ -285,6 +320,15 @@ fn nested_array_capacity_is_checked_and_can_exceed_standard_vector_size() -> Res
 fn array_and_struct_child_capacity_reject_overreach() {
     let array_chunk = DataChunkHandle::new(&[LogicalTypeHandle::array(&LogicalTypeId::Integer.into(), 2)]);
     let mut array = array_chunk.array_vector(0);
+    let alignment_error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        array.child(1);
+    }))
+    .unwrap_err();
+    assert_eq!(
+        panic_payload(alignment_error.as_ref()),
+        "array child capacity must be a multiple of the fixed array size"
+    );
+
     let array_capacity = (unsafe { crate::ffi::duckdb_vector_size() as usize } + 1) * 2;
     let array_error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         array.child(array_capacity);
@@ -398,6 +442,7 @@ fn growing_initialized_list_child_revokes_read_access() -> Result<()> {
     unsafe { chunk.assume_initialized() };
 
     let mut list = chunk.list_vector(0);
+    assert_eq!(list.read_child()?.capacity(), 0);
     list.try_set_len(1)?;
 
     assert_eq!(
@@ -408,16 +453,18 @@ fn growing_initialized_list_child_revokes_read_access() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "vtab")]
 fn trusted_input_view_exposes_initialized_payload() -> Result<()> {
-    let mut chunk = DataChunkHandle::new(&[LogicalTypeId::Integer.into()]);
+    let mut owner = DataChunkHandle::new(&[LogicalTypeId::Integer.into()]);
     {
-        let mut vector = chunk.flat_vector(0);
+        let mut vector = owner.flat_vector(0);
         unsafe { vector.copy(&[42_i32]) };
     }
 
-    chunk.set_len(1);
-    unsafe { chunk.assume_initialized() };
-    let vector = FlatVector::from_vector(chunk.initialized_vector(0, 1)?)?;
+    owner.set_len(1);
+    unsafe { owner.assume_initialized() };
+    let input = unsafe { DataChunkHandle::new_unowned_input(owner.get_ptr()) };
+    let vector = input.flat_vector(0);
     assert_eq!(unsafe { vector.as_slice_with_len::<i32>(1) }, &[42]);
     Ok(())
 }
@@ -465,11 +512,5 @@ fn union_vectors_are_not_adapted_as_structs() {
         chunk.struct_vector(0);
     }))
     .unwrap_err();
-    let message = error
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| error.downcast_ref::<&str>().copied())
-        .unwrap();
-
-    assert!(message.contains("expected struct vector, got Union"));
+    assert!(panic_payload(error.as_ref()).contains("expected struct vector, got Union"));
 }
