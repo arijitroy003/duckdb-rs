@@ -5,7 +5,7 @@ use super::{
     state::ReadableSpan,
     r#struct::StructVector,
 };
-use std::ops::Range;
+use std::{fmt::Display, ops::Range};
 
 use crate::{
     Result,
@@ -35,8 +35,7 @@ impl VectorRef<'_> {
 
     fn raw_list_len(&self) -> Result<usize> {
         let len = unsafe { duckdb_list_vector_get_size(self.ptr) };
-        usize::try_from(len)
-            .map_err(|_| duckdb_failure_from_message(format!("DuckDB list child size {len} exceeds usize range")))
+        checked_usize(len, format_args!("DuckDB list child size {len}"))
     }
 
     fn read_list_entry(&self, row: usize) -> Result<Option<(usize, usize)>> {
@@ -52,18 +51,14 @@ impl VectorRef<'_> {
         // SAFETY: the row was checked against the explicit entry capacity and
         // initialized views guarantee non-null entry payloads are readable.
         let entry = unsafe { ptr.add(row).read() };
-        let offset = usize::try_from(entry.offset).map_err(|_| {
-            duckdb_failure_from_message(format!(
-                "DuckDB list entry offset {} at row {row} exceeds usize range",
-                entry.offset
-            ))
-        })?;
-        let length = usize::try_from(entry.length).map_err(|_| {
-            duckdb_failure_from_message(format!(
-                "DuckDB list entry length {} at row {row} exceeds usize range",
-                entry.length
-            ))
-        })?;
+        let offset = checked_usize(
+            entry.offset,
+            format_args!("DuckDB list entry offset {} at row {row}", entry.offset),
+        )?;
+        let length = checked_usize(
+            entry.length,
+            format_args!("DuckDB list entry length {} at row {row}", entry.length),
+        )?;
         Ok(Some((offset, length)))
     }
 
@@ -251,6 +246,10 @@ impl VectorRef<'_> {
             )
         }
     }
+}
+
+fn checked_usize(value: u64, context: impl Display) -> Result<usize> {
+    usize::try_from(value).map_err(|_| duckdb_failure_from_message(format!("{context} exceeds usize range")))
 }
 
 fn list_entry_end(offset: usize, length: usize, row: usize) -> Result<usize> {
