@@ -1,8 +1,10 @@
 use std::{
+    any::Any,
     error::Error,
     ffi::CString,
     fmt::Display,
     io::{self, Write},
+    mem,
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
@@ -15,7 +17,7 @@ where
     match catch_unwind(AssertUnwindSafe(|| callback().map_err(|error| error.to_string()))) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(error),
-        Err(payload) => Err(format!("Rust callback panicked: {}", panic_payload(payload.as_ref()))),
+        Err(payload) => Err(format!("Rust callback panicked: {}", take_panic_payload(payload))),
     }
 }
 
@@ -25,14 +27,21 @@ pub(crate) fn catch_boxed_callback<T>(callback: impl FnOnce() -> Result<T, Box<d
 
 pub(crate) fn catch_drop(callback: impl FnOnce()) {
     if let Err(payload) = catch_unwind(AssertUnwindSafe(callback)) {
+        let message = take_panic_payload(payload);
         let _ = catch_unwind(AssertUnwindSafe(|| {
             let _ = writeln!(
                 io::stderr().lock(),
                 "duckdb-rs caught a callback-state destructor panic: {}",
-                panic_payload(payload.as_ref())
+                message
             );
         }));
     }
+}
+
+fn take_panic_payload(payload: Box<dyn Any + Send>) -> String {
+    let message = panic_payload(payload.as_ref());
+    mem::forget(payload);
+    message
 }
 
 pub(crate) fn error_c_string(error: &str) -> CString {
@@ -59,7 +68,11 @@ fn format_error_chain(error: &dyn Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, fmt, panic::panic_any};
+    use std::{
+        error::Error,
+        fmt,
+        panic::{AssertUnwindSafe, catch_unwind, panic_any},
+    };
 
     use super::{catch_boxed_callback, catch_callback, catch_drop, error_c_string};
 
@@ -107,6 +120,14 @@ mod tests {
         }
     }
 
+    struct PanickingDropPayload;
+
+    impl Drop for PanickingDropPayload {
+        fn drop(&mut self) {
+            panic!("panic payload destructor");
+        }
+    }
+
     #[test]
     fn catches_callback_and_error_display_panics() {
         let callback_error = catch_callback(|| -> Result<(), std::io::Error> { panic!("callback panic") }).unwrap_err();
@@ -132,5 +153,20 @@ mod tests {
     #[test]
     fn callback_errors_are_valid_c_strings() {
         assert_eq!(error_c_string("before\0after").to_str().unwrap(), "before\\0after");
+    }
+
+    #[test]
+    fn panicking_payload_destructors_are_contained() {
+        let callback = catch_unwind(AssertUnwindSafe(|| {
+            catch_callback(|| -> Result<(), std::io::Error> { panic_any(PanickingDropPayload) })
+        }))
+        .expect("caught callback payload must not panic while being dropped")
+        .unwrap_err();
+        assert!(callback.contains("Rust callback panicked"));
+
+        catch_unwind(AssertUnwindSafe(|| {
+            catch_drop(|| panic_any(PanickingDropPayload));
+        }))
+        .expect("caught destructor payload must not panic while being dropped");
     }
 }
