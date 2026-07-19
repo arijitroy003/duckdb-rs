@@ -12,7 +12,7 @@ use arrow::{
 use libduckdb_sys::{duckdb_date, duckdb_string_t, duckdb_time};
 
 use crate::{
-    core::{ArrayVector, DataChunkHandle, FlatVector, ListVector, LogicalTypeId, ResultExt, StructVector, VectorRef},
+    core::{ArrayVector, DataChunkHandle, FlatVector, ListVector, LogicalTypeId, StructVector, VectorRef},
     types::DuckString,
 };
 
@@ -71,26 +71,36 @@ fn fixed_size_rows(rows: &SourceRows, width: usize) -> Result<SourceRows, Box<dy
     Ok(child_rows)
 }
 
-fn primitive_array_from_rows<T, P, F>(vector: &VectorRef<'_>, rows: &SourceRows, convert: F) -> PrimitiveArray<P>
+fn primitive_array_from_rows<T, P, F>(
+    vector: &VectorRef<'_>,
+    rows: &SourceRows,
+    convert: F,
+) -> Result<PrimitiveArray<P>, Box<dyn Error>>
 where
     T: Copy,
     P: ArrowPrimitiveType,
     F: Fn(T) -> P::Native,
 {
-    rows.iter()
+    let values = rows
+        .iter()
         .copied()
         .map(|source_row| {
             source_row
                 // SAFETY: scalar dispatch instantiates `T` for the logical
                 // type's physical storage, and validity masking already
                 // dropped null rows, so each selected slot is initialized.
-                .map(|row| convert(unsafe { vector.read::<T>(row) }.or_panic()))
+                .map(|row| unsafe { vector.read::<T>(row) }.map(&convert))
+                .transpose()
         })
-        .collect()
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok(values.into_iter().collect())
 }
 
 /// Reads rows whose Arrow native type matches the DuckDB physical storage.
-fn native_rows<P: ArrowPrimitiveType>(vector: &VectorRef<'_>, rows: &SourceRows) -> PrimitiveArray<P> {
+fn native_rows<P: ArrowPrimitiveType>(
+    vector: &VectorRef<'_>,
+    rows: &SourceRows,
+) -> Result<PrimitiveArray<P>, Box<dyn Error>> {
     primitive_array_from_rows::<P::Native, P, _>(vector, rows, |value| value)
 }
 
@@ -98,7 +108,7 @@ fn native_array_from_rows<P: ArrowPrimitiveType>(
     vector: &VectorRef<'_>,
     rows: &SourceRows,
 ) -> Result<Arc<dyn Array>, Box<dyn Error>> {
-    Ok(Arc::new(native_rows::<P>(vector, rows)))
+    Ok(Arc::new(native_rows::<P>(vector, rows)?))
 }
 
 /// Converts the first `len` rows of a DuckDB vector to an Arrow array.
@@ -141,21 +151,24 @@ fn scalar_vector_rows_to_arrow_array(
         // TIMESTAMP_TZ stores UTC microseconds; a data chunk carries no
         // session display timezone.
         LogicalTypeId::TimestampTZ => Ok(Arc::new(
-            native_rows::<TimestampMicrosecondType>(vector, rows).with_timezone("UTC"),
+            native_rows::<TimestampMicrosecondType>(vector, rows)?.with_timezone("UTC"),
         )),
         LogicalTypeId::Varchar => {
             let values = rows
                 .iter()
+                .copied()
                 .map(|source_row| {
-                    source_row.map(|row| {
-                        // SAFETY: the logical type establishes `duckdb_string_t`
-                        // physical storage, and validity masking already dropped
-                        // null rows, so each selected slot is initialized.
-                        let mut ptr = unsafe { vector.read::<duckdb_string_t>(row) }.or_panic();
-                        DuckString::new(&mut ptr).as_str().to_string()
-                    })
+                    source_row
+                        .map(|row| {
+                            // SAFETY: the logical type establishes `duckdb_string_t`
+                            // physical storage, and validity masking already dropped
+                            // null rows, so each selected slot is initialized.
+                            unsafe { vector.read::<duckdb_string_t>(row) }
+                                .map(|mut ptr| DuckString::new(&mut ptr).as_str().to_string())
+                        })
+                        .transpose()
                 })
-                .collect::<Vec<_>>();
+                .collect::<crate::Result<Vec<_>>>()?;
 
             Ok(Arc::new(StringArray::from(values)))
         }
@@ -167,7 +180,12 @@ fn scalar_vector_rows_to_arrow_array(
                 .copied()
                 // SAFETY: validity masking already dropped null rows, so each
                 // selected one-byte slot is initialized.
-                .map(|source_row| source_row.map(|row| unsafe { vector.read::<u8>(row) }.or_panic() != 0));
+                .map(|source_row| {
+                    source_row
+                        .map(|row| unsafe { vector.read::<u8>(row) }.map(|value| value != 0))
+                        .transpose()
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
 
             Ok(Arc::new(BooleanArray::from_iter(values)))
         }
@@ -177,12 +195,12 @@ fn scalar_vector_rows_to_arrow_array(
             vector,
             rows,
             |value| value.days,
-        ))),
+        )?)),
         LogicalTypeId::Time => Ok(Arc::new(primitive_array_from_rows::<
             duckdb_time,
             Time64MicrosecondType,
             _,
-        >(vector, rows, |value| value.micros))),
+        >(vector, rows, |value| value.micros)?)),
         LogicalTypeId::Smallint => native_array_from_rows::<Int16Type>(vector, rows),
         LogicalTypeId::USmallint => native_array_from_rows::<UInt16Type>(vector, rows),
         LogicalTypeId::Blob | LogicalTypeId::Geometry => {
@@ -197,7 +215,7 @@ fn scalar_vector_rows_to_arrow_array(
                         // SAFETY: Blob and Geometry use DuckDB string storage
                         // for their bytes, and validity masking already dropped
                         // null rows, so each selected slot is initialized.
-                        let mut ptr = unsafe { vector.read::<duckdb_string_t>(row) }.or_panic();
+                        let mut ptr = unsafe { vector.read::<duckdb_string_t>(row) }?;
                         let mut value = DuckString::new(&mut ptr);
                         builder.append_value(value.as_bytes());
                     }
