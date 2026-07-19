@@ -1,5 +1,3 @@
-use std::ffi::CString;
-
 use function::{ScalarFunction, ScalarFunctionSet};
 use libduckdb_sys::{
     duckdb_data_chunk, duckdb_function_info, duckdb_scalar_function_get_extra_info, duckdb_scalar_function_set_error,
@@ -8,8 +6,8 @@ use libduckdb_sys::{
 
 use crate::{
     Connection,
-    arrow_interop::WritableVector,
-    core::{DataChunkHandle, LogicalTypeHandle},
+    callback::{catch_boxed_callback, error_c_string},
+    core::{DataChunkHandle, LogicalTypeHandle, WritableVector, WritableVectorRef},
     inner_connection::InnerConnection,
 };
 mod function;
@@ -144,8 +142,8 @@ impl ScalarFunctionInfo {
         unsafe { &*(duckdb_scalar_function_get_extra_info(self.0).cast()) }
     }
 
-    pub unsafe fn set_error(&self, error: &str) {
-        let c_str = CString::new(error).unwrap();
+    pub fn set_error(&self, error: &str) {
+        let c_str = error_c_string(error);
         unsafe { duckdb_scalar_function_set_error(self.0, c_str.as_ptr()) };
     }
 }
@@ -154,13 +152,14 @@ unsafe extern "C" fn scalar_func<T>(info: duckdb_function_info, input: duckdb_da
 where
     T: VScalar,
 {
-    unsafe {
-        let info = ScalarFunctionInfo::from(info);
-        let mut input = DataChunkHandle::new_unowned(input);
-        let result = T::invoke(info.get_extra_info(), &mut input, &mut output);
-        if let Err(e) = result {
-            info.set_error(&e.to_string());
-        }
+    let info = ScalarFunctionInfo::from(info);
+    let result = catch_boxed_callback(|| unsafe {
+        let mut input = DataChunkHandle::new_unowned_input(input);
+        let mut output = WritableVectorRef::from_raw(&mut output, input.len())?;
+        T::invoke(info.get_extra_info(), &mut input, &mut output)
+    });
+    if let Err(error) = result {
+        info.set_error(&error);
     }
 }
 
@@ -217,7 +216,10 @@ impl InnerConnection {
 
 #[cfg(test)]
 mod test {
-    use std::error::Error;
+    use std::{
+        error::Error,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     use arrow::array::Array;
     use libduckdb_sys::duckdb_string_t;
@@ -251,6 +253,85 @@ mod test {
             vec![ScalarFunctionSignature::exact(
                 vec![LogicalTypeId::Varchar.into()],
                 LogicalTypeId::Varchar.into(),
+            )]
+        }
+    }
+
+    struct PanickingScalar;
+
+    impl VScalar for PanickingScalar {
+        type State = ();
+
+        fn invoke(
+            _: &Self::State,
+            _: &mut DataChunkHandle,
+            _: &mut dyn WritableVector,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            panic!("scalar callback panic")
+        }
+
+        fn signatures() -> Vec<ScalarFunctionSignature> {
+            vec![ScalarFunctionSignature::exact(
+                vec![LogicalTypeId::Bigint.into()],
+                LogicalTypeId::Bigint.into(),
+            )]
+        }
+    }
+
+    struct NulErrorScalar;
+
+    impl VScalar for NulErrorScalar {
+        type State = ();
+
+        fn invoke(
+            _: &Self::State,
+            _: &mut DataChunkHandle,
+            _: &mut dyn WritableVector,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            Err("before\0after".into())
+        }
+
+        fn signatures() -> Vec<ScalarFunctionSignature> {
+            vec![ScalarFunctionSignature::exact(
+                vec![LogicalTypeId::Bigint.into()],
+                LogicalTypeId::Bigint.into(),
+            )]
+        }
+    }
+
+    static SCALAR_STATE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Default)]
+    struct PanickingDropState;
+
+    impl Drop for PanickingDropState {
+        fn drop(&mut self) {
+            SCALAR_STATE_DROPS.fetch_add(1, Ordering::SeqCst);
+            panic!("scalar state destructor panic");
+        }
+    }
+
+    struct PanickingDropStateScalar;
+
+    impl VScalar for PanickingDropStateScalar {
+        type State = PanickingDropState;
+
+        fn invoke(
+            _: &Self::State,
+            input: &mut DataChunkHandle,
+            output: &mut dyn WritableVector,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let mut output = output.flat_vector();
+            for row in 0..input.len() {
+                unsafe { output.write(row, 42_i64) };
+            }
+            Ok(())
+        }
+
+        fn signatures() -> Vec<ScalarFunctionSignature> {
+            vec![ScalarFunctionSignature::exact(
+                vec![LogicalTypeId::Bigint.into()],
+                LogicalTypeId::Bigint.into(),
             )]
         }
     }
@@ -444,6 +525,44 @@ mod test {
     }
 
     #[test]
+    fn scalar_panics_become_query_errors() -> Result<(), Box<dyn Error>> {
+        let conn = Connection::open_in_memory()?;
+        conn.register_scalar_function::<PanickingScalar>("panicking_scalar")?;
+
+        let error = conn.prepare("SELECT panicking_scalar(42)")?.query([]).err().unwrap();
+
+        assert!(error.to_string().contains("scalar callback panic"));
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_errors_escape_interior_nuls_through_registered_callback() -> Result<(), Box<dyn Error>> {
+        let conn = Connection::open_in_memory()?;
+        conn.register_scalar_function::<NulErrorScalar>("nul_error_scalar")?;
+
+        let error = conn.prepare("SELECT nul_error_scalar(42)")?.query([]).err().unwrap();
+        let message = error.to_string();
+
+        assert!(message.contains("before\\0after"));
+        assert!(!message.contains('\0'));
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_state_destructor_panics_are_contained() -> Result<(), Box<dyn Error>> {
+        SCALAR_STATE_DROPS.store(0, Ordering::SeqCst);
+        {
+            let conn = Connection::open_in_memory()?;
+            conn.register_scalar_function::<PanickingDropStateScalar>("panicking_drop_state")?;
+            let value: i64 = conn.query_row("SELECT panicking_drop_state(1)", [], |row| row.get(0))?;
+            assert_eq!(value, 42);
+        }
+
+        assert!(SCALAR_STATE_DROPS.load(Ordering::SeqCst) > 0);
+        Ok(())
+    }
+
+    #[test]
     fn test_repeat_scalar() -> Result<(), Box<dyn Error>> {
         let conn = Connection::open_in_memory()?;
         conn.register_scalar_function::<Repeat>("nobie_repeat")?;
@@ -479,7 +598,6 @@ mod test {
     }
 
     // Counters for testing volatile functions
-    use std::sync::atomic::{AtomicU64, Ordering};
     static VOLATILE_COUNTER: AtomicU64 = AtomicU64::new(0);
     static NON_VOLATILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
