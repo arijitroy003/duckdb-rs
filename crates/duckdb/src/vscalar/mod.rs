@@ -46,11 +46,10 @@ pub trait VScalar: Sized {
     ///   for this invocation;
     /// - not retain `input`, `output`, or any vector/slice derived from them
     ///   past return;
-    /// - not hold two writable wrappers over the same column at the same
-    ///   time. The column accessors (`flat_vector`, `list_vector`, ...) take
-    ///   `&self`, so safe code can obtain two wrappers over one column and
-    ///   call `as_mut_slice` on each, yielding overlapping `&mut [T]` —
-    ///   undefined behavior.
+    ///
+    /// Native output and child accessors borrow their owner mutably. Legacy
+    /// top-level chunk accessors also lease at most one active view per column,
+    /// so safe implementations cannot create aliased writable views.
     fn invoke(
         state: &Self::State,
         input: &mut DataChunkHandle,
@@ -340,6 +339,56 @@ mod test {
         }
     }
 
+    struct CapacityCheckedScalar {}
+
+    impl VScalar for CapacityCheckedScalar {
+        type State = ();
+
+        fn invoke(
+            _: &Self::State,
+            input: &mut DataChunkHandle,
+            output: &mut dyn WritableVector,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let len = input.len();
+            if input.capacity() != len {
+                return Err(format!(
+                    "callback input capacity {} differs from cardinality {len}",
+                    input.capacity()
+                )
+                .into());
+            }
+            let values = {
+                let vector = input.flat_vector(0);
+                if vector.capacity() != len {
+                    return Err(format!(
+                        "callback input vector capacity {} differs from cardinality {len}",
+                        vector.capacity()
+                    )
+                    .into());
+                }
+                unsafe { vector.as_slice_with_len::<i64>(len) }.to_vec()
+            };
+
+            let mut output = output.flat_vector();
+            if output.capacity() != len {
+                return Err(format!(
+                    "callback output capacity {} differs from cardinality {len}",
+                    output.capacity()
+                )
+                .into());
+            }
+            unsafe { output.copy(&values) };
+            Ok(())
+        }
+
+        fn signatures() -> Vec<ScalarFunctionSignature> {
+            vec![ScalarFunctionSignature::exact(
+                vec![LogicalTypeId::Bigint.into()],
+                LogicalTypeId::Bigint.into(),
+            )]
+        }
+    }
+
     #[test]
     fn test_scalar() -> Result<(), Box<dyn Error>> {
         let conn = Connection::open_in_memory()?;
@@ -415,6 +464,20 @@ mod test {
         Ok(())
     }
 
+    #[test]
+    fn test_callback_vectors_use_exact_invocation_capacity() -> Result<(), Box<dyn Error>> {
+        let conn = Connection::open_in_memory()?;
+        conn.register_scalar_function::<CapacityCheckedScalar>("capacity_checked")?;
+
+        let values = conn
+            .prepare("SELECT capacity_checked(i) FROM range(3) AS values(i)")?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(values, [0, 1, 2]);
+        Ok(())
+    }
+
     // Counters for testing volatile functions
     use std::sync::atomic::{AtomicU64, Ordering};
     static VOLATILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -432,10 +495,9 @@ mod test {
         ) -> Result<(), Box<dyn std::error::Error>> {
             let len = input.len();
             let mut output_vec = output.flat_vector();
-            let data = unsafe { output_vec.as_mut_slice::<i64>() };
-
-            for item in data.iter_mut().take(len) {
-                *item = NON_VOLATILE_COUNTER.fetch_add(1, Ordering::SeqCst) as i64;
+            for row in 0..len {
+                let value = NON_VOLATILE_COUNTER.fetch_add(1, Ordering::SeqCst) as i64;
+                unsafe { output_vec.write(row, value) };
             }
             Ok(())
         }
@@ -460,10 +522,9 @@ mod test {
         ) -> Result<(), Box<dyn std::error::Error>> {
             let len = input.len();
             let mut output_vec = output.flat_vector();
-            let data = unsafe { output_vec.as_mut_slice::<i64>() };
-
-            for item in data.iter_mut().take(len) {
-                *item = VOLATILE_COUNTER.fetch_add(1, Ordering::SeqCst) as i64;
+            for row in 0..len {
+                let value = VOLATILE_COUNTER.fetch_add(1, Ordering::SeqCst) as i64;
+                unsafe { output_vec.write(row, value) };
             }
             Ok(())
         }
